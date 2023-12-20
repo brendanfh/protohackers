@@ -1,0 +1,95 @@
+use core {io, net, thread, iter, string, math}
+use core.encoding.json
+
+main :: () {
+    server := net.tcp_server_make(32);
+    server.emit_data_events = false;
+
+    assert(server->listen(7000), "Failed to listen.");
+    server->handle_events() {
+        case .Ready {
+            event := cast(&net.TCP_Event.Ready) it.data; // @improve
+            client := event.client;
+
+            t: thread.Thread;
+            thread.spawn(&t, client, client_handler);
+        }
+    }
+}
+
+client_handler :: client => {
+    r := io.reader_make(&client.socket);
+    w := io.writer_make(&client.socket, 0);
+
+    while true {
+        request_line := r->read_until('\n');
+        defer delete(&request_line);
+
+        r->read_byte();
+        
+        // If nothing was returned
+        if string.empty(request_line) do break;
+
+        switch json.decode_with_result(request_line) {
+            case .Err {
+                io.write(&w, "No 1.\n");
+                break break;
+            }
+
+            case res: .Ok {
+                defer delete(res);
+                method := res.root["method"]->as_str();
+                if method != "isPrime" {
+                    io.write(&w, "No 2.\n");
+                    break break;
+                }
+
+                number := res.root["number"];
+                is_prime := switch number->type() {
+                    case .Integer => isPrime(number->as_int());
+                    case .Float   => do {
+                        f := number->as_float();
+                        if math.floor(f) == f {
+                            return isPrime(cast(i64) math.floor(f));
+                        }
+
+                        return false;
+                    }
+                    case #default => do {
+                        io.write(&w, "No 3.\n");
+                        break break;
+                        return false;
+                    }
+                };
+
+                json.encode(&w, MethodResponse.{
+                    method = "isPrime",
+                    prime = is_prime
+                });
+                io.write(&w, "\n");
+            }
+        }
+    }
+
+    net.tcp_server_kill_client(null, client);
+}
+
+
+MethodResponse :: struct {
+    method: str;
+    prime: bool;
+}
+
+isPrime :: (n: i64) -> bool {
+    if n < 2 do return false;
+    if n == 2 do return true;
+
+    upper := cast(u64) math.ceil(math.sqrt(cast(f64) n));
+
+    while it: u64 = 2; it <= upper {
+        if n % it == 0 do return false;
+        it += 1;
+    }
+
+    return true;
+}

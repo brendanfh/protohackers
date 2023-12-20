@@ -1,0 +1,96 @@
+use core {*}
+
+main :: () {
+    listen_socket := net.socket_create(.Inet, .Stream, .IP)->unwrap();
+    listen_socket->option(.ReuseAddress, true);
+
+    listen_address := net.make_ipv4_address("0.0.0.0", 7000);
+    listen_socket->bind(&listen_address);
+
+    listen_socket->listen(128);
+    while true {
+        accept_result := listen_socket->accept();
+        accept_result.Ok->with([accepted_client] {
+            // Move the socket into the heap so it can referenced later
+            // in another thread.
+            permanent_socket := context.allocator->move(accepted_client.socket);
+
+            // This thread is going to be discard and allowed to run freely.
+            // We will never join with this thread.
+            t: thread.Thread;
+            thread.spawn(&t, permanent_socket, client_handler);
+        });
+    }
+}
+
+
+DataPoint :: struct {
+    time: i32;
+    price: i32;
+}
+
+client_handler :: socket => {
+    reader := io.reader_make(socket);
+    writer := io.writer_make(socket, 0);
+
+    data_points := make([..] DataPoint);
+
+    while true {
+        alloc.clear_temp_allocator();
+
+        input: [9] u8;
+        err := reader->read_fill_buffer(input);
+
+        if err == .EOF {
+            break;
+        }
+
+        switch input[0] {
+            case 'I' {
+                timestamp := read_big_endian(input[1..5]);
+                price     := read_big_endian(input[5..9]);
+
+                array.push(&data_points, .{ timestamp, price });
+            }
+
+            case 'Q' {
+                mintime := read_big_endian(input[1..5]);
+                maxtime := read_big_endian(input[5..9]);
+
+                results := iter.as_iter(data_points)
+                    |> iter.filter((dp, [mintime, maxtime]) =>
+                        mintime <= dp.time && dp.time <= maxtime)
+                    |> iter.map(x => cast(i64) x.price)
+                    |> iter.collect();
+                defer delete(&results);
+
+                average := 0;
+                if results.count > 0 {
+                    average = ~~(array.sum(results) / ~~results.count);
+                }
+
+                write_big_endian(&writer, average);
+            }
+
+            case #default do break break;
+        }
+    }
+
+    socket->shutdown(.ReadWrite);
+    socket->close();
+}
+
+read_big_endian :: (bytes: [] u8) -> i32 {
+    return
+        (cast(u32) bytes[0] << 24) |
+        (cast(u32) bytes[1] << 16) |
+        (cast(u32) bytes[2] << 8) |
+        (cast(u32) bytes[3] << 0);
+}
+
+write_big_endian :: (w: &io.Writer, n: u32) {
+    io.write_byte(w, cast(u8) ((n & 0xff000000) >> 24));
+    io.write_byte(w, cast(u8) ((n & 0xff0000) >> 16));
+    io.write_byte(w, cast(u8) ((n & 0xff00) >> 8));
+    io.write_byte(w, cast(u8) ( n & 0xff));
+}

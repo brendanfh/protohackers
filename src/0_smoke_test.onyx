@@ -1,0 +1,38 @@
+use core {io, net, iter, thread}
+
+
+main :: () {
+    server := net.tcp_server_make(32);
+    // server.emit_data_events = false; 
+
+    server->listen(7000);
+    server->handle_events() {
+        case .Data {
+            event := cast(&net.TCP_Event.Data) it.data;
+            io.stream_write(&event.client.socket, event.contents);
+        }
+
+        // case .Ready {
+        //     event := cast(&net.TCP_Event.Ready) it.data; // @improve
+        //     client := event.client;
+
+        //     t: thread.Thread;
+        //     thread.spawn(&t, client, client_handler);
+        // }
+    }
+}
+
+// client_handler :: (client: &net.TCP_Server.Client) {
+//     buf: [1024] u8;
+//     while true {
+//         err, bytes_read := io.stream_read(&client.socket, buf); // @improve: pass &client directly?
+//         io.stream_write(&client.socket, buf[0 .. bytes_read]);
+// 
+//         if err == .EOF {
+//             break;
+//         }
+//     }
+// 
+//     // @improve: remove dependency on server here
+//     net.tcp_server_kill_client(null, client);
+// }

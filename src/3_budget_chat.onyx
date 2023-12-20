@@ -1,0 +1,206 @@
+use core {*}
+
+ConnectionState :: enum {
+    Waiting_For_Name;
+    In_Room;
+    Closing;
+}
+
+Connection :: struct {
+    state: ConnectionState;
+
+    name: str;
+    socket: net.Socket;
+
+    _buffer: dyn_str;
+}
+
+#inject
+Connection.make :: (s: net.Socket, ally := context.allocator) -> &Connection {
+    return ally->move(Connection.{
+        state = .Waiting_For_Name,
+        socket = s,
+        _buffer = make(dyn_str, ally)
+    });
+}
+
+#inject
+Connection.try_get_line :: (c: &Connection) -> ? str {
+    if index := string.index_of(c._buffer, '\n'); index >= 0 {
+        out := string.temp_copy(c._buffer[0 .. index]);
+        memory.copy(c._buffer.data, c._buffer.data + index + 1, c._buffer.length - index - 1);
+        c._buffer.length -= index + 1;
+        return out;
+    }
+
+    return .None;
+}
+
+#inject
+Connection.destroy :: (c: &Connection) {
+    if c.name do delete(&c.name);
+    c.socket->close();
+    delete(&c._buffer);
+    context.allocator->free(c);
+}
+
+#inject
+Connection.recv :: (c: &Connection) {
+    buf: [1024] u8;
+    bytes_read := c.socket->recv_into(buf);
+
+    string.append(&c._buffer, buf[0 .. bytes_read]);
+}
+
+active_connections: [..] &Connection;
+
+send_to_all_connected_clients :: (msg: str, except: &Connection) {
+    for active_connections {
+        if it == except do continue;
+        if it.state != .In_Room do continue;
+
+        io.stream_write(&it.socket, msg);
+    }
+}
+
+main :: () {
+    listen_socket := net.socket_create(.Inet, .Stream, .IP)->unwrap();
+    listen_socket->option(.ReuseAddress, true);
+    listen_socket->option(.NonBlocking, true);
+
+    listen_address := net.make_ipv4_address("0.0.0.0", 7000);
+    listen_socket->bind(&listen_address);
+
+    listen_socket->listen(128);
+    logf(.Info, "Listening on 7000");
+
+    while true {
+        alloc.clear_temp_allocator();
+
+        // Wait for someone to do something.
+        readable_connections := wait(&listen_socket, -1);
+        defer delete(&readable_connections);
+
+        // Try to accept a new connection.
+        listen_socket->accept().Ok->with([accepted_client] {
+            io.stream_write(&accepted_client.socket, "Welcome to budgetchat! What shall I call you?\n");
+
+            // Create a new connection on the heap.
+            array.push(&active_connections, Connection.make(accepted_client.socket));
+        });
+
+        for c: readable_connections {
+            c->recv();
+
+            switch c.state {
+                case .Waiting_For_Name {
+                    msg := c->try_get_line()->or_continue();
+
+                    if !validate_name(msg) {
+                        io.stream_write(&c.socket, "Illegal name. Try again.\n");
+                        c.socket->close();
+                        continue;
+                    }
+
+                    c.name = string.alloc_copy(msg);
+                    logf(.Info, "{} connected!", c.name);
+
+                    presence := string.to_dyn_str("* The room contains: ");
+                    defer delete(&presence);
+
+                    for active_connections {
+                        if it == c do continue;
+                        if it.state != .In_Room do continue;
+
+                        string.append(&presence, it.name);
+                        string.append(&presence, " ");
+                    }
+                    string.append(&presence, "\n");
+                    io.stream_write(&c.socket, presence);
+
+                    // Announce to all other users
+                    announcement := tprintf("* {} has entered the chat room!\n", c.name);
+                    send_to_all_connected_clients(announcement, c);
+
+                    c.state = .In_Room;
+                }
+
+                case .In_Room {
+                    msg := c->try_get_line()->or_continue();
+
+                    logf(.Info, "[{}] {}", c.name, msg);
+
+                    data := tprintf("[{}] {}\n", c.name, msg);
+                    send_to_all_connected_clients(data, c);
+                }
+
+                case .Closing {
+                    // If the name is empty, they did not officially connect.
+                    if !c.name do continue;
+
+                    logf(.Info, "{} disconnected", c.name);
+
+                    data := tprintf("* {} has left\n", c.name);
+                    send_to_all_connected_clients(data, c);
+                }
+            }
+        }
+
+        // Remove all dead connections.
+        for iter.as_iter(&active_connections) {
+            if it.state == .Closing {
+                delete(it);
+                #remove;
+            }
+        }
+    }
+}
+
+wait :: (s1: &net.Socket, timeout: i32) -> [..] &Connection {
+    sockets: [] &net.Socket;
+    stat_buf: [] net.Socket_Poll_Status;
+
+    stat_buf = alloc.array_from_stack(net.Socket_Poll_Status, active_connections.length + 1);
+    sockets = alloc.array_from_stack(&net.Socket, active_connections.length + 1);
+    sockets[0] = s1;
+
+    for i: active_connections.length {
+        sockets[i + 1] = &active_connections[i].socket;
+    }
+
+    net.socket_poll_all(sockets, stat_buf, timeout);
+
+    result: [..] &Connection;
+    for i: 1 .. sockets.length {
+        if stat_buf[i] == .Readable {
+            result << active_connections[i - 1];
+        }
+
+        if stat_buf[i] == .Closed {
+            active_connections[i - 1].state = .Closing;
+            result << active_connections[i - 1];
+        }
+    }
+
+    return result;
+}
+
+validate_name :: (name: str) -> bool {
+    has_a_character := false;
+    for ch: name {
+        if !ch->is_alphanum() do return false;
+        if ch->is_alpha() {
+            has_a_character = true;
+        }
+    }
+
+    return has_a_character;
+}
+
+#inject
+Optional.or_continue :: macro (o: ? $T) -> T {
+    switch o {
+        case v: .Some do return v;
+        case .None do continue;
+    }
+}
