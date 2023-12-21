@@ -1,0 +1,44 @@
+use core {*}
+
+
+main :: () {
+    listen_socket := net.socket_create(.Inet, .Dgram, .IP)->unwrap();
+    listen_socket->option(.ReuseAddress, true);
+
+    listen_address := net.make_ipv4_address("0.0.0.0", 7000);
+    assert(listen_socket->bind(&listen_address), "Failed to bind");
+
+    database := make(Map(str, str));
+
+    while true {
+        buffer: [1024] u8;
+        result := listen_socket->recvfrom(buffer)->unwrap();
+
+        msg := buffer[0 .. result.count];
+        logf(.Info, "Recv ({}): '{}'", result.addr, msg);
+
+        if msg == "version" {
+            listen_socket->sendto("version=onyx-db 1.0", &result.addr);
+            continue;
+        }
+
+        if string.contains(msg, "=") {
+            key, value := string.bisect(msg, "=");
+            database->put(
+                string.alloc_copy(key),
+                string.alloc_copy(value)
+            );
+
+        } else {
+            key := msg;
+            value := database->get(key) ?? "";
+
+            response := tprintf("{}={}", key, value);
+            if response.length == 0 do continue;
+
+            logf(.Info, "Send ({}): '{}'", result.addr, response);
+
+            bytes_sent := listen_socket->sendto(response, &result.addr);
+        }
+    }
+}
