@@ -1,0 +1,110 @@
+use core {*}
+
+main :: () {
+    listen_socket := net.socket_create(.Inet, .Stream, .IP)->unwrap();
+    listen_socket->option(.ReuseAddress, true);
+
+    listen_address := net.make_ipv4_address("0.0.0.0", 5000);
+    assert(listen_socket->bind(&listen_address), "Failed to bind");
+
+    assert(listen_socket->listen(), "Failed to listen");
+    logf(.Info, "Listening on 5000");
+    while true {
+        connected_client := listen_socket->accept().Ok ?? [] { break; };
+
+        // Every client will get its own thread, because its much easier,
+        // and because they can be handled completely independently.
+        t := new(thread.Thread);
+        thread.spawn(t, context.allocator->move(connected_client.socket), client_handle);
+    }
+}
+
+client_handle :: (client: &net.Socket) {
+    // Connect to the other server
+    upstream := net.socket_create(.Inet, .Stream, .IP)->unwrap();
+    upstream->connect(&net.SocketAddress.{
+        HostPort = .{ "chat.protohackers.com", 16963 }
+    });
+
+    // Make buffers for either side of communication.
+    client_buf := make(dyn_str);
+    upstream_buf := make(dyn_str);
+
+    while true {
+        alloc.clear_temp_allocator();
+
+        // Wait for either side to send something.
+        status: [2] net.Socket_Poll_Status;
+        net.socket_poll_all(
+            .[client, &upstream],
+            status,
+            -1
+        );
+
+        // If the client sent something, put it in the client buffer.
+        if status[0] == .Readable {
+            buf: [1024] u8;
+            received := client->recv_into(buf);
+
+            string.append(&client_buf, buf[0 .. received]);
+        }
+
+        // If the upstream sent something, put it in the upstream buffer.
+        if status[1] == .Readable {
+            buf: [1024] u8;
+            received := upstream->recv_into(buf);
+
+            string.append(&upstream_buf, buf[0 .. received]);
+        }
+
+        // If either side is closed, end the tunnel.
+        if slice.some(status, [s](s == .Closed)) {
+            break;
+        }
+
+        // Process the messages.
+        maybe_process_msg(&client_buf, &upstream);
+        maybe_process_msg(&upstream_buf, client);
+    }
+
+    upstream->close();
+    client->close();
+}
+
+maybe_process_msg :: (buf: &dyn_str, recipient: &net.Socket) {
+    // Check if we've seen a new-line yet.
+    index := string.index_of(*buf, '\n');
+    if index < 0 do return;
+
+    // Extract the message and slide the existing message data down the buffer
+    out := string.temp_copy(buf.data[0 .. index]);
+    memory.copy(buf.data, buf.data + index + 1, buf.length - index - 1);
+    buf.length -= index + 1;
+
+    // Send the response and doing malicious things to it
+    io.stream_write(recipient, tprintf("{}\n", do_malicious_things(out)));
+}
+
+do_malicious_things :: (msg: str) =>
+    string.split_iter(msg, ' ')
+        // For each "word" in the message, see if it needs to be replaced.
+        |> iter.map(x => {
+            // Must start with a 7.
+            if x[0] != '7' do return x;
+
+            // Must be between 26 and 35 (inclusive).
+            if x.length < 26 || x.length > 35 do return x;
+
+            // Every character must be alpha numeric.
+            if !slice.every(x, [x](x->is_alphanum())) do return x;
+
+            // Hard coded alternate address.
+            return "7YWHMfk9JZe0LM0g1ZauHuiSxhI";
+        })
+
+        // Turn into an array of strings.
+        |> iter.collect()
+
+        // Join all strings with a ' ' between them.
+        |> string.join(" ", allocator=context.temp_allocator)
+
